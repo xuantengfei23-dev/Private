@@ -1,4 +1,4 @@
-// /api/generate —— Fast Minimal（500–1000 字 + 标题聪明截断 + 一次补齐）
+// /api/generate —— Fast Minimal（500–1000 字 + 标题多模板 + 尾句收口 + 一次补齐）
 // 环境变量：OPENROUTER_KEY（必需），OR_HTTP_REFERER / OR_X_TITLE（可选）
 
 export const config = { runtime: 'edge' };
@@ -15,7 +15,7 @@ function corsHeaders() {
 
 /* -------------------- 常量 / 轻工具 -------------------- */
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
-const TIMEOUT_MS     = 25000; // 25s：先于 Vercel 平台超时，避免 504
+const TIMEOUT_MS     = 25000; // 25s：先于平台超时，避免 504
 const MODEL_DEFAULT  = 'meta-llama/llama-3.1-8b-instruct';
 
 // 最小化去重短语（避免营销腔/模板腔）
@@ -69,14 +69,50 @@ function dedupSentences(s=''){
 function smartClip(s = '', limit = 24) {
   if (s.length <= limit) return s;
   const cut = s.slice(0, limit);
-  const m = cut.match(/.*?[。！？.!?：:；;,，、]/); // 到最后一个标点
+  const m = cut.match(/.*?[。！？.!?：:；;,，、]/);
   if (m && m[0].length >= Math.max(6, limit * 0.6)) {
     return m[0].replace(/[：:；;,，、]$/,'');
   }
   return cut.replace(/[\s\-_/,:;，。！？!?.]+$/,'').trim();
 }
 
-// —— 正文清洗 + 标题生成
+/* -------------------- 标题：从正文抽一句 + 模板随机 -------------------- */
+// 提炼一句可做标题的短句（优先正文中含 token / 或 outline）
+function pickTitleCandidate(body='', token='', outline=''){
+  const lines = String(body).split(/\n+/).filter(Boolean);
+  const sentences = (lines.join(' ')).split(/[。！？.!?]/).map(s=>s.trim()).filter(Boolean);
+  // 1) 含 token 的句子优先
+  const r1 = sentences.find(s => new RegExp(`\\b${token}\\b`, 'i').test(s));
+  if (r1) return r1;
+  // 2) 与 outline 关键词重合的
+  if (outline) {
+    const key = String(outline).split(/[，,。；;：:\s]/)[0] || outline;
+    const r2 = sentences.find(s => s.includes(key));
+    if (r2) return r2;
+  }
+  // 3) 退化为第一句
+  return sentences[0] || (lines[0] || '').slice(0, 24);
+}
+
+const TITLE_TEMPLATES = [
+  (k, p)=>`${k}：${p}`,
+  (k, p)=>`${k}观察｜${p}`,
+  (k, p)=>`${p}（${k}）`,
+  (k, p)=>`${k}要点：${p}`,
+  (k, p)=>`${k}进展速记｜${p}`,
+  (k, p)=>`${k}｜${p}`,
+];
+
+function makeTitleFrom(body, token, outline){
+  const MAX = 48;
+  const base = pickTitleCandidate(body, token, outline).replace(/[#*$@>\-]/g,'');
+  let tpl = TITLE_TEMPLATES[(Math.random()*TITLE_TEMPLATES.length)|0];
+  let title = tpl(token, smartClip(base, Math.max(10, MAX-6)));
+  if (title.length > MAX) title = title.slice(0, MAX); // 超长兜底
+  return title;
+}
+
+/* -------------------- 正文清洗 + 标题生成 -------------------- */
 function sanitizeOut(bodyText='', token='') {
   let text = String(bodyText||'').replace(/\r/g,'').trim();
   text = stripMarketing(text);
@@ -84,19 +120,13 @@ function sanitizeOut(bodyText='', token='') {
   text = dedupSentences(text);
   text = text.replace(/\n{3,}/g, '\n\n').trim();
 
+  // —— 用正文+outline 生成更“像标题”的标题（不再机械抄首段）
   const MAX_TITLE = 48;
-  const prefix    = `${token}｜`;
-  const avail     = Math.max(10, MAX_TITLE - prefix.length);
-
-  const firstLine = text.split(/\n/)[0] || '';
-  const firstSent = (firstLine.split(/[。！？.!?]/)[0] || firstLine)
-                      .replace(/[#*$@>\-]/g,'');
-
-  let title = prefix + smartClip(firstSent, avail);
-  if (!title.trim() || title === `${token}｜`) title = `${token} 更新`;
+  let title = makeTitleFrom(text, token, (globalThis.__LAST_OUTLINE__ || ''));
+  if (!title.trim()) title = `${token} 更新`;
   if (title.length > MAX_TITLE) title = title.slice(0, MAX_TITLE);
 
-  // 内存最近 50 个标题去重（轻量）
+  // 最近 50 条标题去重（轻量）
   const h = hashStr(title.toLowerCase());
   if (RECENT.includes(h)) {
     const tweak = ['快评','观察','要点','随记'][Math.floor(Math.random()*4)];
@@ -168,6 +198,11 @@ async function callUpstreamFast({ model, messages, temperature, max_tokens, sign
   return j;
 }
 
+/* -------------------- 小工具：是否以句末标点结束 -------------------- */
+function endsWithPunct(s=''){
+  return /[。！？.!?」”’)\]]\s*$/.test(String(s).trim());
+}
+
 /* -------------------- Handler -------------------- */
 export default async function handler(req) {
   if (req.method === 'OPTIONS') {
@@ -195,7 +230,7 @@ export default async function handler(req) {
       system = '',
       model = MODEL_DEFAULT,
       temperature = 0.70,          // 为长文稍收敛
-      max_tokens  = 1000,          // 500–1000 字推荐 1000~1100
+      max_tokens  = 1200,          // 500–1000 字推荐 1000~1200（更不容易被截）
       lang = 'zh',
       token = 'BTC',
       context = {}                 // { outline, tags, mentions, tickers }
@@ -209,6 +244,7 @@ export default async function handler(req) {
 
     // System / User（带 outline 提示）
     const outlineHint = (context?.outline || '').trim();
+    globalThis.__LAST_OUTLINE__ = outlineHint; // 提供给标题生成使用
     const sysText = [
       system,
       buildSystemFast({ token, language: lang, outline: outlineHint })
@@ -238,7 +274,7 @@ export default async function handler(req) {
       data?.choices?.[0]?.message?.content ?? data?.output_text ?? ''
     ).replace(/^```[\s\S]*?```$/g,'').trim();
 
-    // 软裁：超长时在标点收尾
+    // 软裁：工具函数（局部）
     function softTrimBody(s='', limit=1000){
       if (s.length <= limit) return s;
       const cut = s.slice(0, limit);
@@ -265,8 +301,35 @@ export default async function handler(req) {
       } catch(_) {} // 忽略补齐失败
     }
 
-    // 超长就软裁到 1000 字附近
-    if (clean.length > 1100) clean = softTrimBody(clean, 1000);
+    // —— 若结尾不像完整句子（没句号/叹问号等），且还有时间，就补 1–2 句把它“收口”
+    if (!endsWithPunct(clean)) {
+      const budget = leftMs();
+      if (budget > 4500) {
+        try {
+          const controller3 = new AbortController();
+          const to3 = setTimeout(()=>controller3.abort(), Math.min(4000, budget-800));
+          const more2 = await callUpstreamFast({
+            model, temperature: 0.66, max_tokens: 180,
+            messages: [
+              { role:'system', content: '只续写 1–2 句把上文收尾；不重复已写内容；输出纯正文。' },
+              { role:'user',   content: `延续并完整收尾这段话的最后一句：\n\n${clean.slice(-260)}` }
+            ],
+            signal: controller3.signal
+          });
+          clearTimeout(to3);
+          const add2 = String(more2?.choices?.[0]?.message?.content ?? more2?.output_text ?? '').trim();
+          if (add2) clean = `${clean}${add2}`;
+        } catch(_) {
+          // 忽略补写失败
+        }
+      } else {
+        // 没预算了就软性补一个句号，避免硬断
+        clean = clean.replace(/\s*$/, '。');
+      }
+    }
+
+    // 超长再软裁到 ~1200（更温和，避免砍太多）
+    if (clean.length > 1300) clean = softTrimBody(clean, 1200);
 
     const sOut = sanitizeOut(clean, token);
 
