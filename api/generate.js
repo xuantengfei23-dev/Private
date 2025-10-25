@@ -21,7 +21,7 @@ function corsHeaders() {
 
 /* -------------------- 常量 / 工具 -------------------- */
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
-const TIMEOUT_MS = 35000;                 // 放宽 35s，减少高峰期超时
+const TIMEOUT_MS = 25000;                 // 放宽 35s，减少高峰期超时
 const JSON_MODE = (process.env.JSON_MODE === '1');
 
 const DEDUP_PHRASES_ZH = [
@@ -396,8 +396,8 @@ export default async function handler(req) {
       prompt = '',
       system = '',
       model = 'meta-llama/llama-3.1-8b-instruct',
-      temperature = 0.85,            // 提高多样化
-      max_tokens = 900,
+      temperature = 0.75,            // 提高多样化
+      max_tokens = 700,
       lang = 'zh',
       token = 'BTC',
       ptype = 'short',
@@ -453,12 +453,18 @@ export default async function handler(req) {
 
     // 调上游（带超时+重试）
     const controller = new AbortController();
-    const to = setTimeout(()=>controller.abort(), TIMEOUT_MS);
-    const data = await withRetries(
-      () => callUpstreamJSON({ model, messages, temperature, max_tokens, signal: controller.signal }),
-      3, 250
-    );
-    clearTimeout(to);
+const to = setTimeout(() => controller.abort(), TIMEOUT_MS);
+let data;
+try {
+  data = await withRetries(
+    () => callUpstreamJSON({ model, messages, temperature, max_tokens, signal: controller.signal }),
+    2,                      // 重试 2 次，避免把总时长拖爆
+    250
+  );
+} finally {
+  clearTimeout(to);         // 无论成功/失败都清理
+}
+
 
     // 解析输出（优先 JSON）
     const raw = data?.choices?.[0]?.message?.content ?? data?.output_text ?? '';
@@ -473,9 +479,9 @@ export default async function handler(req) {
     // 校验
     let flags = validateOutput(out, token);
 
-    // 自动修复（最多 2 次）
+    // 自动修复（最多 1 次）
     let repaired_attempts = 0;
-    while (!flags.ok && repaired_attempts < 2) {
+    while (!flags.ok && repaired_attempts < 1) {
       repaired_attempts++;
       const repairUser = buildRepairMessage(out, token, flags.reasons, lang);
       const repairMessages = [
