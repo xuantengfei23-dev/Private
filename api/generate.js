@@ -4,9 +4,8 @@
 // - OR_HTTP_REFERER / OR_X_TITLE (可选，用于统计归因)
 // - JSON_MODE=1 （可选；上游支持 json_object 时强制 JSON 输出）
 // - KV_REST_URL / KV_REST_TOKEN （可选；Upstash/Redis REST 用于持久化学习状态）
-// - ADMIN_KEY （可选；配合 /api/state 使用）
 //
-// 兼容前端返回字段：{ title, text, tags, tickers, mentions, verifiable_detail, usage, model, ... }
+// 返回结构兼容前端：顶层含 { title, text, tags, ... }，并镜像到 data:{title,text,tags}
 
 export const config = { runtime: 'edge' };
 
@@ -22,7 +21,7 @@ function corsHeaders() {
 
 /* -------------------- 常量 / 工具 -------------------- */
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
-const TIMEOUT_MS = 18000;
+const TIMEOUT_MS = 35000;                 // 放宽 35s，减少高峰期超时
 const JSON_MODE = (process.env.JSON_MODE === '1');
 
 const DEDUP_PHRASES_ZH = [
@@ -59,13 +58,13 @@ const ERR = {
   VALID: 'ERR_VALIDATION',
   RATE: 'ERR_RATE_LIMIT',
 };
+
 const ok  = (trace_id, data) => ({ ok: true, trace_id, ...data });
 const err = (trace_id, code, message, extra={}) => ({ ok: false, trace_id, code, message, ...extra });
 
 const clamp = (n, a, b) => Math.min(b, Math.max(a, n));
 const pick  = (arr) => arr[(Math.random()*arr.length)|0];
 const uniq  = (arr) => Array.from(new Set((arr||[]).filter(Boolean)));
-const shuffle = (arr) => arr.slice().sort(()=>Math.random()-0.5);
 
 /* 轻度 hash（标题去重） */
 function hashStr(s=''){ let h=2166136261>>>0; for (let i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=Math.imul(h,16777619) } return (h>>>0).toString(36); }
@@ -102,13 +101,11 @@ function extractJson(text='') {
 }
 
 function limitEmoji(s='') {
-  // 允许最多 2 个 emoji，避免花哨
+  // 最多 2 个 emoji
   const arr = Array.from(s);
   let count = 0;
   return arr.map(ch=>{
-    if (/\p{Emoji_Presentation}/u.test(ch)) {
-      return (++count <= 2) ? ch : '';
-    }
+    if (/\p{Emoji_Presentation}/u.test(ch)) return (++count <= 2) ? ch : '';
     return ch;
   }).join('');
 }
@@ -229,7 +226,7 @@ function buildSystem({ token='BTC', language='zh', persona, formatHint }) {
     `· 代币经济（用途/发行/销毁/治理最小闭环）`,
     `· 生态集成（钱包/桥/基础设施/数据源/合作方）`,
     `· 近 3 个月里程碑/提案（编号/名称；不确定就给验证路径）`,
-    `· 风险与边界（权限/依赖/合规/可升级性）`,
+    `· 风险与边界（权限/依赖/可升级性）`,
     `事实约束：不编造具体数据/时间；不确定时写“验证路径”。`,
   ].join('\n') : [
     `Focus strictly on ${token}. No price predictions or TA.`,
@@ -305,6 +302,9 @@ async function callUpstreamJSON({ model, messages, temperature, max_tokens, sign
       model,
       messages,
       temperature: Number(temperature),
+      top_p: 0.95,
+      frequency_penalty: 0.2,
+      presence_penalty: 0.15,
       max_tokens: clamp(Number(max_tokens)||0, 1, 2000),
       ...(JSON_MODE ? { response_format: { type: 'json_object' } } : {})
     }),
@@ -396,7 +396,7 @@ export default async function handler(req) {
       prompt = '',
       system = '',
       model = 'meta-llama/llama-3.1-8b-instruct',
-      temperature = 0.7,
+      temperature = 0.85,            // 提高多样化
       max_tokens = 900,
       lang = 'zh',
       token = 'BTC',
@@ -501,11 +501,11 @@ export default async function handler(req) {
     }
     rememberTitle(state, token, out.title);
 
-    // 存回学习状态
+    // 存回学习状态（KV 可选）
     state.updatedAt = Date.now();
     await saveState(state);
 
-    // 回包
+    // 回包（顶层字段 + data 镜像，兼容旧前端）
     const payload = ok(trace_id, {
       id: data?.id,
       model: data?.model || model,
@@ -528,6 +528,9 @@ export default async function handler(req) {
       },
       warnings: JSON_MODE ? [] : ['json_mode_off: best-effort JSON extraction']
     });
+
+    // 镜像 data 以兼容前端的 (j.data || j) 解析
+    payload.data = { title: payload.title, text: payload.text, tags: payload.tags };
 
     return new Response(JSON.stringify(payload), { status: 200, headers: corsHeaders() });
 
