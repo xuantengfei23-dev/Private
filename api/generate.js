@@ -1,4 +1,5 @@
-// /api/generate —— Fast Minimal（500–1000 字 + 标题多模板 + 尾句收口 + 一次补齐）
+// /api/generate —— v1.1 模式化长度控制（article 900–1200；short 140–280）
+// 兼容旧入参（不破坏你现有调用），新增：mode / min_chars / max_chars / postKind
 // 环境变量：OPENROUTER_KEY（必需），OR_HTTP_REFERER / OR_X_TITLE（可选）
 
 export const config = { runtime: 'edge' };
@@ -18,14 +19,11 @@ const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const TIMEOUT_MS     = 25000; // 25s：先于平台超时，避免 504
 const MODEL_DEFAULT  = 'meta-llama/llama-3.1-8b-instruct';
 
-// 最小化去重短语（避免营销腔/模板腔）
 const DEDUP_PHRASES_ZH = [
   '点赞关注','一键三连','欢迎私信','带你了解','冲冲冲','不构成投资建议',
   '一定要看','别再错过','爆赚','财富自由','总结来说','综上所述','最后我们来看',
   '赶紧','速看','建议收藏','分享给朋友'
 ];
-
-// 轻语气/开场钩子（提升“人味”，不影响速度）
 const TONES = [
   '口吻自然、克制，像和朋友交流但保持客观，不用营销口号。',
   '语气平实、少形容词，不要煽动性词汇。',
@@ -77,23 +75,18 @@ function smartClip(s = '', limit = 24) {
 }
 
 /* -------------------- 标题：从正文抽一句 + 模板随机 -------------------- */
-// 提炼一句可做标题的短句（优先正文中含 token / 或 outline）
 function pickTitleCandidate(body='', token='', outline=''){
   const lines = String(body).split(/\n+/).filter(Boolean);
   const sentences = (lines.join(' ')).split(/[。！？.!?]/).map(s=>s.trim()).filter(Boolean);
-  // 1) 含 token 的句子优先
   const r1 = sentences.find(s => new RegExp(`\\b${token}\\b`, 'i').test(s));
   if (r1) return r1;
-  // 2) 与 outline 关键词重合的
   if (outline) {
     const key = String(outline).split(/[，,。；;：:\s]/)[0] || outline;
     const r2 = sentences.find(s => s.includes(key));
     if (r2) return r2;
   }
-  // 3) 退化为第一句
   return sentences[0] || (lines[0] || '').slice(0, 24);
 }
-
 const TITLE_TEMPLATES = [
   (k, p)=>`${k}：${p}`,
   (k, p)=>`${k}观察｜${p}`,
@@ -102,13 +95,12 @@ const TITLE_TEMPLATES = [
   (k, p)=>`${k}进展速记｜${p}`,
   (k, p)=>`${k}｜${p}`,
 ];
-
 function makeTitleFrom(body, token, outline){
   const MAX = 48;
-  const base = pickTitleCandidate(body, token, outline).replace(/[#*$@>\-]/g,'');
+  const base = pickTitleCandidate(body, token, outline).replace(/[#*$@>\-]/g,'').trim();
   let tpl = TITLE_TEMPLATES[(Math.random()*TITLE_TEMPLATES.length)|0];
   let title = tpl(token, smartClip(base, Math.max(10, MAX-6)));
-  if (title.length > MAX) title = title.slice(0, MAX); // 超长兜底
+  if (title.length > MAX) title = title.slice(0, MAX);
   return title;
 }
 
@@ -120,13 +112,11 @@ function sanitizeOut(bodyText='', token='') {
   text = dedupSentences(text);
   text = text.replace(/\n{3,}/g, '\n\n').trim();
 
-  // —— 用正文+outline 生成更“像标题”的标题（不再机械抄首段）
   const MAX_TITLE = 48;
   let title = makeTitleFrom(text, token, (globalThis.__LAST_OUTLINE__ || ''));
   if (!title.trim()) title = `${token} 更新`;
   if (title.length > MAX_TITLE) title = title.slice(0, MAX_TITLE);
 
-  // 最近 50 条标题去重（轻量）
   const h = hashStr(title.toLowerCase());
   if (RECENT.includes(h)) {
     const tweak = ['快评','观察','要点','随记'][Math.floor(Math.random()*4)];
@@ -137,34 +127,55 @@ function sanitizeOut(bodyText='', token='') {
   return { title, text };
 }
 
-/* -------------------- System / User（500–1000 字） -------------------- */
-function buildSystemFast({ token='BTC', language='zh', outline='' }) {
+/* -------------------- System / User（按模式生成） -------------------- */
+function buildSystemByMode({ token='BTC', language='zh', outline='', mode='article', min=900, max=1200 }) {
   const zh   = (language||'zh').toLowerCase().startsWith('zh');
   const tone = pick(TONES);
   if (zh) {
+    if (mode === 'short') {
+      return [
+        tone,
+        `输出一条中文短贴，**总长度严格控制在 ${min}–${max} 字**（汉字计数），建议 1–2 段，语气自然克制。`,
+        `只围绕 ${token} 的一个清晰要点展开；可包含 1 个可核验细节（时间/版本/编号/tx 片段）。`,
+        outline ? `尽量围绕「${outline}」展开；如无把握给出查验路径。` : '',
+        '禁止价格预测/点位/K线；禁止口号与营销腔。',
+        `输出**纯正文**，不要任何 JSON/列表/代码块。`
+      ].filter(Boolean).join('\n');
+    } else {
+      return [
+        tone,
+        `输出一篇中文文章，**总长度严格控制在 ${min}–${max} 字**（汉字计数），分 3–5 段，每段 ≥150 字。`,
+        `只围绕 ${token} 的一个明确主题展开；包含 1–2 个可核验细节（时间/版本/编号/tx 片段）。`,
+        outline ? `尽量围绕「${outline}」展开；如无把握给出查验路径。` : '',
+        '禁止价格预测/点位/K线；禁止口号与营销腔。',
+        '输出**纯正文**，不要任何 JSON/列表/代码块。'
+      ].filter(Boolean).join('\n');
+    }
+  }
+  // 英文分支（如需）
+  if (mode === 'short') {
     return [
-      tone,
-      '输出一篇中文短文，**总长度控制在 500–1000 字**，建议分 2–3 段，逻辑清晰、口语化但专业。',
-      `只围绕 ${token} 的一个清晰要点展开；包含 1–2 个可核验细节（时间/版本/编号/tx 片段）。`,
-      outline ? `**尽量围绕**「${outline}」展开，如无把握可写可验证路径。` : '',
-      '禁止价格预测/点位/K线；禁止“点赞关注/不构成投资建议/总结来说”等模板化语句。',
-      '输出**纯正文**，不要任何 JSON/列表/代码块。'
+      'Calm, natural, non-promotional tone.',
+      `Write a short Chinese post **${min}-${max} chars**, 1–2 short paragraphs.`,
+      `Focus strictly on ${token}, include one verifiable detail (time/version/id/tx snippet).`,
+      outline ? `Prefer focusing on: ${outline}` : '',
+      'No TA/price targets; output plain text only.'
     ].filter(Boolean).join('\n');
   }
   return [
     'Calm, natural, non-promotional tone.',
-    'Write a Chinese short article **500–1000 chars**, 2–3 paragraphs.',
+    `Write a Chinese article **${min}-${max} chars**, 3–5 paragraphs, each ≥150 chars.`,
     `Focus strictly on ${token}, include 1–2 verifiable details (time/version/id/tx snippet).`,
     outline ? `Prefer focusing on: ${outline}` : '',
-    'No price targets/TA; output plain text only.'
+    'No TA/price targets; output plain text only.'
   ].filter(Boolean).join('\n');
 }
 function buildUserFast({ prompt='', language='zh' }) {
   const zh = (language||'zh').toLowerCase().startsWith('zh');
-  return zh ? (prompt || '来一段简洁的人性化分析。') : (prompt || 'A short human-like analysis.');
+  return zh ? (prompt || '来一段自然的人性化分析。') : (prompt || 'A short human-like analysis.');
 }
 
-/* -------------------- 上游调用（一次、无 JSON 模式） -------------------- */
+/* -------------------- 上游调用 -------------------- */
 async function callUpstreamFast({ model, messages, temperature, max_tokens, signal }) {
   const OR_KEY = process.env.OPENROUTER_KEY;
   const referer = process.env.OR_HTTP_REFERER || 'https://your-app.example';
@@ -185,7 +196,7 @@ async function callUpstreamFast({ model, messages, temperature, max_tokens, sign
       top_p: 0.9,
       frequency_penalty: 0.1,
       presence_penalty: 0.1,
-      max_tokens: clamp(Number(max_tokens)||0, 1, 1300)
+      max_tokens: clamp(Number(max_tokens)||0, 1, 1600) // article 也能容纳
     }),
     signal
   });
@@ -225,35 +236,48 @@ export default async function handler(req) {
     }
 
     const body = await req.json().catch(()=> ({}));
+
+    // —— 新增：mode / min_chars / max_chars；并兼容旧字段 postKind/context.postKind
+    const postKind = body.postKind || body.mode || body.kind || body?.context?.postKind || 'article';
+    const mode = (/short/i.test(postKind) ? 'short' : 'article');
+    // 缺省长度：文章 900–1200；短贴 140–280
+    const MIN_DEFAULT = (mode === 'short' ? 140 : 900);
+    const MAX_DEFAULT = (mode === 'short' ? 280 : 1200);
+
     const {
       prompt = '',
       system = '',
       model = MODEL_DEFAULT,
-      temperature = 0.70,          // 为长文稍收敛
-      max_tokens  = 1200,          // 500–1000 字推荐 1000~1200（更不容易被截）
+      temperature = (mode === 'short' ? 0.72 : 0.68),
+      max_tokens  = (mode === 'short' ? 360 : 1600),
       lang = 'zh',
       token = 'BTC',
-      context = {}                 // { outline, tags, mentions, tickers }
+      context = {},
+      min_chars = MIN_DEFAULT,
+      max_chars = MAX_DEFAULT
     } = body || {};
 
     if (!prompt || typeof prompt !== 'string') {
-      return new Response(JSON.stringify(err(trace_id, 'ERR_INPUT', 'Invalid "prompt"')), {
+      return new Response(JSON.stringify(err(trace_id, 'ERR_INPUT', 'Invalid \"prompt\"')), {
         status: 400, headers: corsHeaders(),
       });
     }
+
+    const min = clamp(Number(min_chars)||0, 40, 3000);
+    const max = Math.max(min + 40, clamp(Number(max_chars)||0, min+40, 4000));
 
     // System / User（带 outline 提示）
     const outlineHint = (context?.outline || '').trim();
     globalThis.__LAST_OUTLINE__ = outlineHint; // 提供给标题生成使用
     const sysText = [
       system,
-      buildSystemFast({ token, language: lang, outline: outlineHint })
+      buildSystemByMode({ token, language: lang, outline: outlineHint, mode, min, max })
     ].filter(Boolean).join('\n\n');
     const usrText = buildUserFast({ prompt, language: lang });
 
     // —— 第一次生成（25s 总预算）
     const startTs = Date.now();
-    const leftMs  = () => Math.max(0, TIMEOUT_MS - (Date.now() - startTs) - 1200); // 预留 1.2s
+    const leftMs  = () => Math.max(0, TIMEOUT_MS - (Date.now() - startTs) - 1200);
 
     const controller = new AbortController();
     const to = setTimeout(() => controller.abort(), leftMs());
@@ -274,34 +298,34 @@ export default async function handler(req) {
       data?.choices?.[0]?.message?.content ?? data?.output_text ?? ''
     ).replace(/^```[\s\S]*?```$/g,'').trim();
 
-    // 软裁：工具函数（局部）
+    // 软裁函数
     function softTrimBody(s='', limit=1000){
       if (s.length <= limit) return s;
       const cut = s.slice(0, limit);
       const m = cut.match(/.*?[。！？.!?]/);
-      return (m ? m[0] : cut).replace(/\s+$/,'');
+      return (m ? m[0] : cut).replace(/\s+$/,'').trim();
     }
 
-    // —— 偏短时一次性补齐（只做一次，且必须还在时间预算内）
-    if (clean.length < 500 && leftMs() > 6000) {
+    // —— 若短于 min，尝试“补齐一次”（文章力度更大，短贴也补但更短）
+    if (clean.length < min && leftMs() > 6000) {
       try {
         const controller2 = new AbortController();
         const to2 = setTimeout(()=>controller2.abort(), leftMs());
         const more = await callUpstreamFast({
-          model, temperature: 0.68, max_tokens: 420, // 适度补写
+          model, temperature: (mode==='short'? 0.72 : 0.66), max_tokens: (mode==='short'? 240 : 480),
           messages: [
-            { role:'system', content: '继续保持相同风格与语气；只补充新信息，避免重复；总长度控制在 500–1000 字；输出纯正文。' },
-            { role:'user',   content: `在这段文字基础上补充一段，使总长度达到 500–1000 字，并加入 1 个可核验细节（时间/版本/编号/tx 片段）：\n\n${clean}` }
+            { role:'system', content: `延续同一风格；只补充新信息避免重复；总长度控制在 ${min}–${max} 字；输出纯正文。` },
+            { role:'user',   content: `在这段文字基础上补写，使总长度达到 ${min}–${max} 字：\n\n${clean}` }
           ],
           signal: controller2.signal
         });
         clearTimeout(to2);
         const add = String(more?.choices?.[0]?.message?.content ?? more?.output_text ?? '').trim();
         if (add) clean = `${clean}\n\n${add}`.trim();
-      } catch(_) {} // 忽略补齐失败
+      } catch(_) {}
     }
 
-    // —— 若结尾不像完整句子（没句号/叹问号等），且还有时间，就补 1–2 句把它“收口”
+    // —— 若结尾未收口且还有预算，再补 1–2 句
     if (!endsWithPunct(clean)) {
       const budget = leftMs();
       if (budget > 4500) {
@@ -309,7 +333,7 @@ export default async function handler(req) {
           const controller3 = new AbortController();
           const to3 = setTimeout(()=>controller3.abort(), Math.min(4000, budget-800));
           const more2 = await callUpstreamFast({
-            model, temperature: 0.66, max_tokens: 180,
+            model, temperature: (mode==='short'? 0.7 : 0.66), max_tokens: (mode==='short'? 120 : 180),
             messages: [
               { role:'system', content: '只续写 1–2 句把上文收尾；不重复已写内容；输出纯正文。' },
               { role:'user',   content: `延续并完整收尾这段话的最后一句：\n\n${clean.slice(-260)}` }
@@ -319,17 +343,14 @@ export default async function handler(req) {
           clearTimeout(to3);
           const add2 = String(more2?.choices?.[0]?.message?.content ?? more2?.output_text ?? '').trim();
           if (add2) clean = `${clean}${add2}`;
-        } catch(_) {
-          // 忽略补写失败
-        }
+        } catch(_) {}
       } else {
-        // 没预算了就软性补一个句号，避免硬断
         clean = clean.replace(/\s*$/, '。');
       }
     }
 
-    // 超长再软裁到 ~1200（更温和，避免砍太多）
-    if (clean.length > 1300) clean = softTrimBody(clean, 1200);
+    // 超长软裁到 max
+    if (clean.length > max) clean = softTrimBody(clean, max);
 
     const sOut = sanitizeOut(clean, token);
 
@@ -348,7 +369,7 @@ export default async function handler(req) {
                 .map(s => String(s).replace(/^@/,''))
                 .filter(Boolean).slice(0, 1),
       usage: data?.usage || null,
-      flags: { mode: 'fast-500-1000', timeout_ms: TIMEOUT_MS, length: sOut.text.length }
+      flags: { mode, timeout_ms: TIMEOUT_MS, length: sOut.text.length, range: [min, max] }
     });
     payload.data = { title: payload.title, text: payload.text, tags: payload.tags };
 
