@@ -43,6 +43,7 @@ function traceId(req) {
   return Array.from(arr, b => b.toString(16).padStart(2,'0')).join('');
 }
 function clamp(n,a,b){ return Math.min(b, Math.max(a, n)); }
+function charLen(s=''){ return Array.from(String(s||'')).length; }
 function pick(arr){ return arr[(Math.random()*arr.length)|0]; }
 function hashStr(s=''){ let h=2166136261>>>0; for(let i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=Math.imul(h,16777619)} return (h>>>0).toString(36); }
 
@@ -196,7 +197,7 @@ async function callUpstreamFast({ model, messages, temperature, max_tokens, sign
       top_p: 0.9,
       frequency_penalty: 0.1,
       presence_penalty: 0.1,
-      max_tokens: clamp(Number(max_tokens)||0, 1, 1600) // article 也能容纳
+      max_tokens: clamp(Number(max_tokens)||0, 1, 2000) // article 也能容纳
     }),
     signal
   });
@@ -238,8 +239,8 @@ export default async function handler(req) {
     const body = await req.json().catch(()=> ({}));
 
     // —— 新增：mode / min_chars / max_chars；并兼容旧字段 postKind/context.postKind
-    const postKind = body.postKind || body.mode || body.kind || body?.context?.postKind || 'article';
-    const mode = (/short/i.test(postKind) ? 'short' : 'article');
+    const postKind = body.postKind || body.mode || body.kind || body.lengthProfile || body?.context?.postKind || 'article';
+    const mode = (/short/i.test(postKind) || body.article === false ? 'short' : 'article');
     // 缺省长度：文章 900–1200；短贴 140–280
     const MIN_DEFAULT = (mode === 'short' ? 140 : 900);
     const MAX_DEFAULT = (mode === 'short' ? 280 : 1200);
@@ -253,8 +254,8 @@ export default async function handler(req) {
       lang = 'zh',
       token = 'BTC',
       context = {},
-      min_chars = MIN_DEFAULT,
-      max_chars = MAX_DEFAULT
+      min_chars = (typeof body.min_chars !== 'undefined' ? body.min_chars : (typeof body.min !== 'undefined' ? body.min : MIN_DEFAULT)),
+      max_chars = (typeof body.max_chars !== 'undefined' ? body.max_chars : (typeof body.max !== 'undefined' ? body.max : MAX_DEFAULT))
     } = body || {};
 
     if (!prompt || typeof prompt !== 'string') {
@@ -296,18 +297,18 @@ export default async function handler(req) {
     // 解析（纯文本）
     let clean = String(
       data?.choices?.[0]?.message?.content ?? data?.output_text ?? ''
-    ).replace(/^```[\s\S]*?```$/g,'').trim();
+    ).replace(/```[\s\S]*?```/g,'').trim();
 
     // 软裁函数
     function softTrimBody(s='', limit=1000){
-      if (s.length <= limit) return s;
+      if (charLen(s) <= limit) return s;
       const cut = s.slice(0, limit);
       const m = cut.match(/.*?[。！？.!?]/);
       return (m ? m[0] : cut).replace(/\s+$/,'').trim();
     }
 
     // —— 若短于 min，尝试“补齐一次”（文章力度更大，短贴也补但更短）
-    if (clean.length < min && leftMs() > 6000) {
+    if (charLen(clean) < min && leftMs() > 6000) {
       try {
         const controller2 = new AbortController();
         const to2 = setTimeout(()=>controller2.abort(), leftMs());
@@ -324,6 +325,27 @@ export default async function handler(req) {
         if (add) clean = `${clean}\n\n${add}`.trim();
       } catch(_) {}
     }
+
+    
+// —— 仍未达到 min 时，继续小步扩写（不超过 2 轮，受剩余时间约束）
+if (charLen(clean) < min && leftMs() > 5000) {
+  try {
+    for (let _i=0; _i<2 && charLen(clean) < min && leftMs() > 3500; _i++) {
+      const controllerX = new AbortController();
+      const toX = setTimeout(()=>controllerX.abort(), Math.min(3200, leftMs()-800));
+      const moreX = await callUpstreamFast({
+        model, temperature: (mode==='short'? 0.72 : 0.66), max_tokens: (mode==='short'? 200 : 360),
+        messages: [
+          { role:'system', content: `延续同一风格；只补充新信息避免重复；总长度控制在 ${min}–${max} 字；输出纯正文。` },
+          { role:'user',   content: `在这段文字基础上补写，使总长度达到 ${min}–${max} 字：\n\n${clean.slice(-800)}` }
+        ]
+      });
+      clearTimeout(toX);
+      const addX = String(moreX?.choices?.[0]?.message?.content ?? moreX?.output_text ?? '').trim();
+      if (addX) clean = `${clean}\n\n${addX}`.trim();
+    }
+  } catch(_) {}
+}
 
     // —— 若结尾未收口且还有预算，再补 1–2 句
     if (!endsWithPunct(clean)) {
@@ -350,7 +372,7 @@ export default async function handler(req) {
     }
 
     // 超长软裁到 max
-    if (clean.length > max) clean = softTrimBody(clean, max);
+    if (charLen(clean) > max) clean = softTrimBody(clean, max);
 
     const sOut = sanitizeOut(clean, token);
 
@@ -369,9 +391,9 @@ export default async function handler(req) {
                 .map(s => String(s).replace(/^@/,''))
                 .filter(Boolean).slice(0, 1),
       usage: data?.usage || null,
-      flags: { mode, timeout_ms: TIMEOUT_MS, length: sOut.text.length, range: [min, max] }
+      flags: { mode, timeout_ms: TIMEOUT_MS, length: charLen(sOut.text), range: [min, max] }
     });
-    payload.data = { title: payload.title, text: payload.text, tags: payload.tags };
+    payload.data = { title: payload.title, text: payload.text, tags: payload.tags, mode, min, max };
 
     return new Response(JSON.stringify(payload), { status: 200, headers: corsHeaders() });
 
